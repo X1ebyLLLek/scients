@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch
+*.pth
+*.pkl
+*.pt
+
+# Data
+*.csv
+*.zip
+
+# IDEs
+.idea/
+.vscode/
+
+# Colab / Jupyter
+.ipynb_checkpoints/
+
+# Virtual Env
+venv/
+env/
+
+# Other
+performance.png
+anomaly_threshold.txt
+checkpoint.pth
