@@ -4,12 +4,67 @@ import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
-from sklearn.metrics import fbeta_score
+from sklearn.metrics import matthews_corrcoef, precision_score, recall_score, fbeta_score
 from config import Config
 from dataset import MaskedLogDataset, collate_fn_mlm
 from torch.utils.data import DataLoader
-
+from model import TransformerPredictor 
+from loss import CenterLoss 
 import os
+from torch.utils.tensorboard import SummaryWriter
+import datetime
+
+
+
+def evaluate_hyperparams(train_loader, val_loader, vocab_size, params, device):
+    """
+    Trains a small model for a few epochs to evaluate configuration performance.
+    Returns: min_val_loss
+    """
+    print(f"\n--- HPO Trial: {params} ---")
+    
+    # Initialize model with specific params
+    model = TransformerPredictor(
+        vocab_size=vocab_size, 
+        embed_size=params['embed_size'],
+        num_heads=params['num_heads'],
+        num_layers=params['num_layers'],
+        dropout=params['dropout']
+    ).to(device)
+    
+    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    optimizer = optim.Adam(model.parameters(), lr=Config.LEARNING_RATE)
+    
+    min_val_loss = float('inf')
+    
+    # Short Training Loop
+    for epoch in range(Config.HPO_TRIAL_EPOCHS):
+        model.train()
+        for inputs, targets, labels, mask, session_indices in train_loader:
+            inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
+            optimizer.zero_grad()
+            outputs, _ = model(inputs, mask)
+            loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for inputs, targets, labels, mask, session_indices in val_loader:
+                inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
+                outputs, _ = model(inputs, mask)
+                loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+        if avg_val_loss < min_val_loss:
+            min_val_loss = avg_val_loss
+            
+    print(f"Trial Result: Min Val Loss = {min_val_loss:.4f}")
+    return min_val_loss
 
 def train_model(model, train_loader, val_loader, device):
     """
@@ -17,6 +72,11 @@ def train_model(model, train_loader, val_loader, device):
     """
     print("\n--- Train the Model on Normal Data (Masked Language Modeling) ---")
     criterion = nn.CrossEntropyLoss(ignore_index=-100) # Ignore unmasked tokens
+    
+    # Center Loss Setup
+    center_loss_fn = CenterLoss(num_classes=1, feat_dim=Config.EMBED_SIZE, use_gpu=(device.type == 'cuda')).to(device)
+    optimizer_center = optim.SGD(center_loss_fn.parameters(), lr=0.5) # Center loss usually needs high lr
+    
     # Use standard Adam to avoid potential FSDP/Import hangs with AdamW on some Colab runtimes
     optimizer = optim.Adam(model.parameters(), lr=Config.LEARNING_RATE, weight_decay=1e-3)
     # Increase patience to allow model to overcome small fluctuations
@@ -25,6 +85,11 @@ def train_model(model, train_loader, val_loader, device):
     best_loss = float('inf')
     start_epoch = 0
     patience_counter = 0
+
+    # TensorBoard Setup
+    log_dir = os.path.join("runs", datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"TensorBoard logging to: {log_dir}")
 
     # RESUME LOGIC
     if os.path.exists(Config.CHECKPOINT_PATH):
@@ -51,20 +116,48 @@ def train_model(model, train_loader, val_loader, device):
             inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
             
             optimizer.zero_grad()
-            # BERT forward: output is logits for every token
-            outputs = model(inputs, mask) 
+            optimizer_center.zero_grad()
+            
+            # BERT forward: output is logits for every token AND hidden states
+            logits, features = model(inputs, mask) 
             
             # MLM Loss: compare outputs with targets (where targets != -100)
-            # outputs: (B, L, V) -> (B*L, V)
+            # logits: (B, L, V) -> (B*L, V)
             # targets: (B, L) -> (B*L)
-            loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
+            loss_mlm = criterion(logits.view(-1, logits.size(-1)), targets.view(-1))
+            
+            # Center Loss: Force normal session embeddings to cluster
+            # We use the MEAN of the sequence features as the session representation
+            # mask is (B, L), where False is padding (usually). 
+            # Check model definition: mask passed to transformer is usually padding mask
+            # If src_key_padding_mask is provided, features at padding are likely noise.
+            
+            # Simple mean pooling over non-padded tokens
+            # mask: True where PADDING (in PyTorch Transformer convention often) or NOT?
+            # In dataset.py: padding_mask = (padded_inputs == 0) -> True = Padding
+            
+            # We want to average features where !padding_mask
+            active_features_mask = ~mask # True = Valid Token
+            
+            # features: (B, L, E)
+            # Sum valid features
+            sum_features = (features * active_features_mask.unsqueeze(-1).float()).sum(dim=1)
+            # Count valid tokens
+            valid_token_counts = active_features_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
+            
+            session_embeddings = sum_features / valid_token_counts # (B, E)
+            
+            loss_center = center_loss_fn(session_embeddings, labels=None) # Assume all normal (0) for clustering
+            
+            # Total Loss
+            loss = loss_mlm + Config.CENTER_LOSS_WEIGHT * loss_center
             
             loss.backward()
             
             # Accuracy on masked tokens only
             active_mask = targets != -100
             if active_mask.any():
-                predicted = torch.argmax(outputs, dim=2)
+                predicted = torch.argmax(logits, dim=2)
                 correct = (predicted[active_mask] == targets[active_mask]).sum().item()
                 total = active_mask.sum().item()
                 accuracy = correct / total
@@ -73,8 +166,18 @@ def train_model(model, train_loader, val_loader, device):
                 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            optimizer_center.step()
             total_loss += loss.item()
             total_acc += accuracy
+            
+            # Log step-level metrics
+            global_step = epoch * len(train_loader) + progress_bar.n
+            if global_step % 10 == 0:
+                writer.add_scalar('Train/Loss_Total_Step', loss.item(), global_step)
+                writer.add_scalar('Train/Loss_MLM_Step', loss_mlm.item(), global_step)
+                writer.add_scalar('Train/Loss_Center_Step', loss_center.item(), global_step)
+                writer.add_scalar('Train/Accuracy_Step', accuracy, global_step)
+                
             progress_bar.set_postfix(loss=total_loss / (progress_bar.n + 1), acc=total_acc / (progress_bar.n + 1))
 
         avg_loss = total_loss / len(train_loader)
@@ -82,6 +185,10 @@ def train_model(model, train_loader, val_loader, device):
         avg_acc = total_acc / len(train_loader)
         print(f"Epoch {epoch + 1} average acc: {avg_acc:.4f}")
         scheduler.step(avg_loss)
+        
+        writer.add_scalar('Train/Loss_Epoch', avg_loss, epoch)
+        writer.add_scalar('Train/Accuracy_Epoch', avg_acc, epoch)
+        writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
 
         # Early stopping based on validation loss
         model.eval()
@@ -90,19 +197,23 @@ def train_model(model, train_loader, val_loader, device):
         with torch.no_grad():
             for inputs, targets, labels, mask, session_indices in val_loader:
                 inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
-                outputs = model(inputs, mask)
-                loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
+                logits, _ = model(inputs, mask)
+                loss = criterion(logits.view(-1, logits.size(-1)), targets.view(-1))
                 val_loss += loss.item()
                 
                 active_mask = targets != -100
                 if active_mask.any():
-                    predicted = torch.argmax(outputs, dim=2)
+                    predicted = torch.argmax(logits, dim=2)
                     correct = (predicted[active_mask] == targets[active_mask]).sum().item()
                     total = active_mask.sum().item()
                     val_acc_total += correct / total
 
         avg_val_loss = val_loss / len(val_loader)
+        avg_val_acc = val_acc_total / len(val_loader)
         print(f"Epoch {epoch + 1} average validation loss: {avg_val_loss:.4f}")
+        
+        writer.add_scalar('Validation/Loss', avg_val_loss, epoch)
+        writer.add_scalar('Validation/Accuracy', avg_val_acc, epoch)
 
         if avg_val_loss < best_loss:
             best_loss = avg_val_loss
@@ -127,6 +238,7 @@ def train_model(model, train_loader, val_loader, device):
     
     # Cleanup checkpoint after full training to save space? 
     # Or keep it? Let's keep it.
+    writer.close()
     return model
 
 def calculate_threshold(model, train_df, device, vocab_size):
@@ -150,13 +262,13 @@ def calculate_threshold(model, train_df, device, vocab_size):
     session_losses = defaultdict(list)
     criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
     
-    num_passes = 3 # Stabilize by averaging over multiple random masks
+    num_passes = Config.NUM_STOCHASTIC_PASSES  # Stabilize by averaging over multiple random masks
     for _ in range(num_passes):
         with torch.no_grad():
             for inputs, targets, labels, mask, session_indices in tqdm(threshold_loader,
                                                                        desc="Calculating threshold passes", leave=False):
                 inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
-                outputs = model(inputs, mask)
+                outputs, _ = model(inputs, mask)
                 
                 # Loss per token
                 # outputs: (B, L, V)
@@ -222,12 +334,12 @@ def compute_session_scores_from_sessions(sessions_list, model, device, vocab_siz
     session_losses = defaultdict(list)
     criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
 
-    num_passes = 3
+    num_passes = Config.NUM_STOCHASTIC_PASSES
     for _ in range(num_passes):
         with torch.no_grad():
             for inputs, targets, _, mask, session_indices in temp_loader:
                 inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
-                outputs = model(inputs, mask)
+                outputs, _ = model(inputs, mask)
                 
                 loss_per_token = criterion(outputs.permute(0, 2, 1), targets)
                 active_mask = targets != -100
@@ -253,51 +365,55 @@ def compute_session_scores_from_sessions(sessions_list, model, device, vocab_siz
     
     return scores
 
-def tune_threshold(model, val_sessions, val_labels, anomaly_threshold, device, vocab_size):
+def tune_threshold_mcc(model, val_sessions, val_labels, anomaly_threshold, device, vocab_size):
     """
-    Tunes the threshold on the validation set to maximize F1 score (balanced Precision/Recall).
+    Scientifically determines the best threshold using Matthew's Correlation Coefficient (MCC).
+    MCC is robust to class imbalance.
+    Also calculates Sigma (variance) of normal scores for dynamic 'suspicious' intervals.
     """
-    print("\n-- Tuning threshold on the dedicated validation set --")
+    print("\n-- Scientific Threshold Tuning (MCC Optimization) --")
 
     val_scores = compute_session_scores_from_sessions(val_sessions, model, device, vocab_size, batch_size=Config.BATCH_SIZE)
 
     normal_val_scores = [s for s, l in zip(val_scores, val_labels) if l == 0]
     anomaly_val_scores = [s for s, l in zip(val_scores, val_labels) if l == 1]
 
-    print(f"Validation set scores computed. Normal sessions: {len(normal_val_scores)}, Anomaly sessions: {len(anomaly_val_scores)}")
+    print(f"Validation set stats: {len(normal_val_scores)} Normal, {len(anomaly_val_scores)} Anomalies")
 
     if not normal_val_scores or not anomaly_val_scores:
-        print("WARNING: Validation set lacks either normal or anomaly samples. Skipping threshold tuning.")
-        print(f"Using the threshold calculated from the training set: {anomaly_threshold:.4f}")
-        return anomaly_threshold
+        print("WARNING: Validation set incomplete. Using statistical fallback.")
+        return anomaly_threshold, 0.5 # Default sigma
 
-    # Safe Lower Bound: Don't let threshold drop below 50% of the train set threshold
-    # This prevents the "Collapse to Zero" issue seen in validation
-    lower_bound = anomaly_threshold * 0.5
-    
-    candidate_thresholds = np.linspace(max(min(normal_val_scores), lower_bound), max(normal_val_scores) * 2, 100)
-    if len(anomaly_val_scores) > 0:
-        candidate_thresholds = sorted(list(candidate_thresholds) + list(anomaly_val_scores))
+    # Calculate Sigma for Dynamic Suspicious Threshold
+    val_sigma = np.std(normal_val_scores)
+    print(f"Normal Session Sigma (StdDev): {val_sigma:.4f}")
+
+    # Candidate thresholds
+    min_score = min(min(normal_val_scores), min(anomaly_val_scores))
+    max_score = max(max(normal_val_scores), max(anomaly_val_scores))
+    candidate_thresholds = np.linspace(min_score, max_score, 200)
 
     best_thr = anomaly_threshold
-    best_f1 = -1.0
+    best_mcc = -1.0
+    best_stats = {}
 
     for thr in candidate_thresholds:
         preds = [1 if s > thr else 0 for s in val_scores]
-        # Use F1 score (beta=1.0) for balanced Precision/Recall
-        # [SCIENCE MODE] We prioritize overall effectiveness
-        f1 = fbeta_score(val_labels, preds, beta=1.0, average='binary', zero_division=0)
-
-        if f1 > best_f1:
-            best_f1 = f1
+        
+        mcc = matthews_corrcoef(val_labels, preds)
+        
+        if mcc > best_mcc:
+            best_mcc = mcc
             best_thr = thr
+            prec = precision_score(val_labels, preds, zero_division=0)
+            rec = recall_score(val_labels, preds, zero_division=0)
+            best_stats = {'precision': prec, 'recall': rec}
 
-    if best_f1 <= 0 and anomaly_threshold is not None:
-        print("Validation tuning did not find an improved F1. Keeping the train-set threshold.")
-    else:
-        print(f"Validation tuning result: best_thr={best_thr:.4f} gave best F1-score={best_f1:.4f}")
-        print(f"Previous (train 99p) threshold: {anomaly_threshold:.4f}")
-        anomaly_threshold = float(best_thr)
-        print(f"Threshold updated for evaluation: {anomaly_threshold:.4f}")
-
-    return anomaly_threshold
+    print(f"Optimization Result: Best MCC={best_mcc:.4f} at Threshold={best_thr:.4f}")
+    print(f"Metrics at Best Threshold: Precision={best_stats.get('precision', 0):.4f}, Recall={best_stats.get('recall', 0):.4f}")
+    
+    # Check if optimized threshold is drastically different
+    if best_mcc < 0.2:
+        print("Warning: Correlation is weak. Model might be underfitting or data is too noisy.")
+        
+    return float(best_thr), float(val_sigma)

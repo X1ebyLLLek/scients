@@ -2,14 +2,8 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 from typing import List, Tuple, Any
-from config import Config
-
-import torch
-from torch.utils.data import Dataset
-from torch.nn.utils.rnn import pad_sequence
-from typing import List, Tuple
-from config import Config
 import random
+from config import Config
 
 class MaskedLogDataset(Dataset):
     """

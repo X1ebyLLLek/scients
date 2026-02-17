@@ -63,4 +63,11 @@ class TransformerPredictor(nn.Module):
         # output: (B, L, E)
         
         # Predict logits for EVERY token
-        return self.fc(output) # (B, L, V)
+        logits = self.fc(output) # (B, L, V)
+        
+        # Return both logits and the hidden state (features) for Center Loss
+        # We return the mean embedding of the sequence as the "session representation"
+        # Or returns the full sequence? 
+        # For Center Loss, valid tokens are preferred. 
+        # But let's return full output and let trainer handle masking.
+        return logits, output

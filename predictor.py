@@ -18,7 +18,8 @@ def analyze_log_sequence(
         threshold: float,
         vocab_size: int,
         context_user: str = 'user',
-        context_resource: str = 'standard'
+        context_resource: str = 'standard',
+        sigma: float = 0.5 # Default sigma if not provided
 ) -> Dict[str, Any]:
     """
     Analyzes a log session using the BERT model.
@@ -43,7 +44,7 @@ def analyze_log_sequence(
             if ev in known_classes:
                 event_codes.append(le.transform([ev])[0])
             else:
-                 event_codes.append(unknown_token_code)
+                event_codes.append(unknown_token_code)
                  
     except Exception as e:
         return {"error": f"Encoding failed: {e}", "overall_verdict": "Processing Failed"}
@@ -54,7 +55,7 @@ def analyze_log_sequence(
     # BERT Input Prep
     # We want to score this session.
     # Create a batch of N copies to average out the random masking variance.
-    num_copies = 5
+    num_copies = Config.NUM_STOCHASTIC_PASSES
     
     # Prepare batch for collate_fn_mlm
     # batch list of tuples: (tensor_input, label, session_idx)
@@ -75,7 +76,7 @@ def analyze_log_sequence(
     
     scores = []
     with torch.no_grad():
-        outputs = predictor_model(padded_inputs, mask)
+        outputs, _ = predictor_model(padded_inputs, mask)
         # outputs: (B, L, V)
         # targets: (B, L)
         
@@ -93,8 +94,11 @@ def analyze_log_sequence(
     else:
         session_score = float(np.mean(scores))
 
-    # Threshold checks
-    suspicious_thr = threshold * Config.SUSPICIOUS_THRESHOLD_MULTIPLIER
+    # Dynamic Stat Threshold
+    suspicious_thr = threshold - (Config.SUSPICIOUS_SIGMA_MARGIN * sigma)
+    # Clamp to reasonable bounds (can't be negative, but loss is >0 anyway)
+    suspicious_thr = max(0.5, suspicious_thr)
+
     final_score = apply_contextual_weighting(session_score, context_user, context_resource)
 
     if final_score >= threshold:
@@ -115,6 +119,7 @@ def analyze_log_sequence(
         "final_weighted_score": round(final_score, 4),
         "anomaly_threshold": round(threshold, 4),
         "suspicious_threshold": round(suspicious_thr, 4),
+        "sigma": round(sigma, 4),
         "num_windows": num_copies # actually num_stochastic_passes
     }
 
@@ -123,6 +128,7 @@ def run_demo(test_df, device, vocab_size):
     predictor_model = None
     le_predictor = None
     loaded_threshold = None
+    loaded_sigma = 0.5 # default
     artifacts_loaded = False
 
     try:
@@ -142,7 +148,13 @@ def run_demo(test_df, device, vocab_size):
         with open(Config.ENCODER_PATH, 'rb') as f:
             le_predictor = pickle.load(f)
         with open(Config.THRESHOLD_PATH, 'r') as f:
-            loaded_threshold = float(f.read())
+            # Format: 'THRESHOLD,SIGMA' or just 'THRESHOLD' for backward compat
+            content = f.read().strip()
+            if ',' in content:
+                loaded_threshold, loaded_sigma = map(float, content.split(','))
+            else:
+                loaded_threshold = float(content)
+                
         print("Artifacts loaded successfully.")
         artifacts_loaded = True
     except Exception as e:
@@ -171,17 +183,17 @@ def run_demo(test_df, device, vocab_size):
             abnormal_sequence_example = safe_inverse_transform(le_predictor, abnormal_codes_example)
 
             print(f"1. Analyzing a real normal session (length: {len(normal_sequence_example)})...")
-            result_normal = analyze_log_sequence(normal_sequence_example, predictor_model, le_predictor, loaded_threshold, vocab_size=vocab_size)
+            result_normal = analyze_log_sequence(normal_sequence_example, predictor_model, le_predictor, loaded_threshold, vocab_size=vocab_size, sigma=loaded_sigma)
             print(f"   Verdict: {result_normal.get('overall_verdict', 'Error')} (Risk: {result_normal.get('risk_level', 'N/A')})")
             print(f"   Score: {result_normal.get('max_anomaly_score')} vs Thresholds (Suspicious: {result_normal.get('suspicious_threshold')}, Anomaly: {result_normal.get('anomaly_threshold')})\n")
 
             print(f"2. Analyzing a real abnormal session (length: {len(abnormal_sequence_example)})...")
-            result_abnormal = analyze_log_sequence(abnormal_sequence_example, predictor_model, le_predictor, loaded_threshold, vocab_size=vocab_size)
+            result_abnormal = analyze_log_sequence(abnormal_sequence_example, predictor_model, le_predictor, loaded_threshold, vocab_size=vocab_size, sigma=loaded_sigma)
             print(f"   Verdict: {result_abnormal.get('overall_verdict', 'Error')} (Risk: {result_abnormal.get('risk_level', 'N/A')})")
             print(f"   Score: {result_abnormal.get('max_anomaly_score')} vs Thresholds (Suspicious: {result_abnormal.get('suspicious_threshold')}, Anomaly: {result_abnormal.get('anomaly_threshold')})\n")
 
             print("3. Analyzing the same abnormal session from an 'admin' on a 'critical' resource...")
-            result_critical = analyze_log_sequence(abnormal_sequence_example, predictor_model, le_predictor, loaded_threshold, vocab_size=vocab_size, context_user='admin', context_resource='critical')
+            result_critical = analyze_log_sequence(abnormal_sequence_example, predictor_model, le_predictor, loaded_threshold, vocab_size=vocab_size, context_user='admin', context_resource='critical', sigma=loaded_sigma)
             print(f"   Verdict: {result_critical.get('overall_verdict', 'Error')} (Risk: {result_critical.get('risk_level', 'N/A')})")
             print(f"   Context: {result_critical.get('context')}")
             print(f"   Original Score: {result_critical.get('max_anomaly_score')} -> Weighted Score: {result_critical.get('final_weighted_score')}")
