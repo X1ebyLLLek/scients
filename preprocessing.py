@@ -150,8 +150,13 @@ def prepare_data():
         print(f"Raw label distribution (top 10):")
         print(df['Label'].value_counts().head(10))
         
+        # Сохраняем исходный код категории аномалии (KERNDTLB, KERNSTOR, ...)
+        # для последующего анализа detection rate по типам аномалий
+        raw_labels = df['Label'].astype(str).str.strip()
+        df['AnomalyType'] = raw_labels
+
         # Конвертация: "-" → 0 (Normal), всё остальное → 1 (Anomaly)
-        df['Label'] = df['Label'].apply(lambda x: 0 if str(x).strip() == '-' else 1)
+        df['Label'] = (raw_labels != '-').astype(int)
         
         normal_count = (df['Label'] == 0).sum()
         anomaly_count = (df['Label'] == 1).sum()
@@ -197,6 +202,8 @@ def prepare_data():
         
         df = pd.DataFrame(rows)
         df['Label'] = df['Label'].astype(int)
+        # В синтетическом режиме реальных категорий нет — помечаем единым кодом
+        df['AnomalyType'] = np.where(df['Label'] == 1, 'SYNTHETIC', '-')
         print(f"Synthetic labels: {df.groupby('Label').size().to_dict()}")
 
     # --- ШАГ 5: Определение столбца событий ---
@@ -238,10 +245,24 @@ def prepare_data():
     # --- ШАГ 7: Группировка в сессии ---
     print(f"Sessionizing by 'BlockId' (unique nodes: {df['BlockId'].nunique()})...")
 
-    session_df = df.groupby('BlockId').agg({
+    def session_category(types):
+        """Доминирующая категория аномалии в сессии ('-' если нормальная)."""
+        from collections import Counter
+        bad = [t for t in types if t != '-']
+        return Counter(bad).most_common(1)[0][0] if bad else '-'
+
+    agg_spec = {
         'EventCode': list,
         'Label': 'max'  # Если хоть одна строка аномальная → вся сессия аномальная
-    }).reset_index()
+    }
+    if 'AnomalyType' in df.columns:
+        agg_spec['AnomalyType'] = session_category
+
+    session_df = df.groupby('BlockId').agg(agg_spec).reset_index()
+    if 'AnomalyType' in session_df.columns:
+        session_df.rename(columns={'AnomalyType': 'AnomalyCategory'}, inplace=True)
+    else:
+        session_df['AnomalyCategory'] = np.where(session_df['Label'] == 1, 'UNKNOWN', '-')
 
     print(f"Total sessions before filtering: {len(session_df)}")
 

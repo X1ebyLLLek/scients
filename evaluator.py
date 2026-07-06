@@ -5,8 +5,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 from collections import defaultdict
-from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, confusion_matrix, recall_score, matthews_corrcoef, fbeta_score
+from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, confusion_matrix, recall_score, matthews_corrcoef, fbeta_score, average_precision_score
 from config import Config
+from trainer import aggregate_token_losses
 
 def evaluate_model(model, test_loader, anomaly_threshold, device, sigma=0.5):
     """
@@ -31,13 +32,13 @@ def evaluate_model(model, test_loader, anomaly_threshold, device, sigma=0.5):
                 
                 for i in range(len(session_indices)):
                     session_id = session_indices[i].item()
-                    
-                    # Max loss over masked tokens
+
+                    # Агрегация по Config.SCORE_AGG (max — точечные аномалии)
                     session_mask = active_mask[i]
                     if session_mask.any():
-                        max_session_loss = loss_per_token[i][session_mask].max().item()
-                        session_losses[session_id].append(max_session_loss)
-                    
+                        session_loss = aggregate_token_losses(loss_per_token[i][session_mask])
+                        session_losses[session_id].append(session_loss)
+
                     if session_id not in session_true_labels:
                         session_true_labels[session_id] = labels[i].item()
 
@@ -64,6 +65,14 @@ def evaluate_model(model, test_loader, anomaly_threshold, device, sigma=0.5):
         print(f"Could not compute ROC-AUC: {e}")
         roc_auc = np.nan
 
+    # PR-AUC (Average Precision): при ~7.5% аномалий информативнее ROC-AUC,
+    # т.к. не завышается за счёт большого числа true negatives
+    try:
+        pr_auc = average_precision_score(final_true_labels, final_scores)
+    except ValueError as e:
+        print(f"Could not compute PR-AUC: {e}")
+        pr_auc = np.nan
+
     detection_rate = recall_score(final_true_labels, test_pred_labels_detected, zero_division=0)
 
     print("\nPerformance Metrics on Test Set (Session-Based):")
@@ -76,10 +85,78 @@ def evaluate_model(model, test_loader, anomaly_threshold, device, sigma=0.5):
     print(f"  - F2-Score:  {f2:.4f} (Recall-weighted, critical for security)")
     print(f"  - MCC:       {mcc:.4f} (Matthew's Correlation Coefficient, robust to imbalance)")
     print(f"  - ROC-AUC:   {roc_auc:.4f} (Overall discriminative power)")
+    print(f"  - PR-AUC:    {pr_auc:.4f} (Average Precision, informative under class imbalance)")
     print("--- Metrics for 'Any' Detected Threat (score > suspicious_threshold) ---")
     print(f"  - Detection Rate (Recall): {detection_rate:.4f} (System NOTICED {detection_rate:.0%} of ALL real anomalies)")
 
-    return test_pred_labels_anomaly, final_scores, final_true_labels
+    return test_pred_labels_anomaly, final_scores, final_true_labels, ordered_session_ids, suspicious_threshold
+
+
+def report_per_category(final_scores, final_true_labels, ordered_session_ids,
+                        test_df, anomaly_threshold, suspicious_threshold,
+                        output_csv="per_category_results.csv"):
+    """
+    Detection rate по категориям аномалий BGL (KERNDTLB, KERNSTOR, ...).
+
+    Для каждой категории считает:
+      - число сессий в тесте
+      - recall по порогу anomaly_threshold (явные аномалии)
+      - recall по порогу suspicious_threshold (замеченные инциденты)
+      - средний anomaly score
+
+    Args:
+        final_scores / final_true_labels / ordered_session_ids: выход evaluate_model
+        test_df: тестовый DataFrame с колонкой 'AnomalyCategory'
+        output_csv: путь для сохранения таблицы (для диплома)
+
+    Returns:
+        pd.DataFrame с разбивкой по категориям
+    """
+    import pandas as pd
+
+    if 'AnomalyCategory' not in test_df.columns:
+        print("report_per_category: no 'AnomalyCategory' column — skipping.")
+        return None
+
+    print("\n--- Per-Category Anomaly Detection Breakdown ---")
+
+    rows = []
+    categories = [test_df.iloc[sid]['AnomalyCategory'] for sid in ordered_session_ids]
+
+    by_cat = defaultdict(lambda: {'scores': [], 'labels': []})
+    for score, label, cat in zip(final_scores, final_true_labels, categories):
+        if label == 1:
+            by_cat[cat]['scores'].append(score)
+
+    for cat, data in sorted(by_cat.items(), key=lambda kv: -len(kv[1]['scores'])):
+        scores = np.array(data['scores'])
+        n = len(scores)
+        if n == 0:
+            continue
+        detected_hard = (scores > anomaly_threshold).mean()
+        detected_any = (scores > suspicious_threshold).mean()
+        rows.append({
+            'Category': cat,
+            'Sessions': n,
+            'Recall@anomaly_thr': round(float(detected_hard), 4),
+            'Recall@suspicious_thr': round(float(detected_any), 4),
+            'MeanScore': round(float(scores.mean()), 4),
+        })
+
+    if not rows:
+        print("No anomalous sessions in test set — nothing to break down.")
+        return None
+
+    result_df = pd.DataFrame(rows)
+    print(f"{'Category':<15} {'Sessions':>8} {'Rec@anom':>10} {'Rec@susp':>10} {'MeanScore':>10}")
+    print("-" * 60)
+    for _, r in result_df.iterrows():
+        print(f"{r['Category']:<15} {r['Sessions']:>8} {r['Recall@anomaly_thr']:>10.4f} "
+              f"{r['Recall@suspicious_thr']:>10.4f} {r['MeanScore']:>10.4f}")
+
+    result_df.to_csv(output_csv, index=False)
+    print(f"Saved: {output_csv}")
+    return result_df
 
 def visualize_results(test_pred_labels, test_losses, test_true_labels, anomaly_threshold):
     """

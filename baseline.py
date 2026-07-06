@@ -15,7 +15,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
 from sklearn.metrics import (
     precision_score, recall_score, f1_score, fbeta_score,
-    matthews_corrcoef, roc_auc_score
+    matthews_corrcoef, roc_auc_score, average_precision_score
 )
 from config import Config
 
@@ -74,9 +74,14 @@ def compute_metrics(y_true, y_pred, y_scores=None):
             metrics['roc_auc'] = roc_auc_score(y_true, y_scores)
         except ValueError:
             metrics['roc_auc'] = float('nan')
+        try:
+            metrics['pr_auc'] = average_precision_score(y_true, y_scores)
+        except ValueError:
+            metrics['pr_auc'] = float('nan')
     else:
         metrics['roc_auc'] = float('nan')
-    
+        metrics['pr_auc'] = float('nan')
+
     return metrics
 
 

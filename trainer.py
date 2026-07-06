@@ -15,6 +15,17 @@ from torch.utils.tensorboard import SummaryWriter
 import datetime
 
 
+def aggregate_token_losses(loss_values: torch.Tensor) -> float:
+    """
+    Агрегация per-token losses в оценку сессии (ablation-параметр SCORE_AGG):
+      'max'  — точечные аномалии: одно неожиданное событие поднимает score сессии
+      'mean' — усреднённая pseudo-log-likelihood (менее чувствительна к выбросам)
+    """
+    if Config.SCORE_AGG == "mean":
+        return loss_values.mean().item()
+    return loss_values.max().item()
+
+
 
 def evaluate_hyperparams(train_loader, val_loader, vocab_size, params, device):
     """
@@ -71,8 +82,10 @@ def train_model(model, train_loader, val_loader, device):
     Trains the model and returns the trained model.
     """
     print("\n--- Train the Model on Normal Data (Masked Language Modeling) ---")
+    if not Config.CENTER_LOSS_ENABLED:
+        print("    [ABLATION] Center Loss DISABLED — training with pure MLM loss")
     criterion = nn.CrossEntropyLoss(ignore_index=-100) # Ignore unmasked tokens
-    
+
     # Center Loss Setup
     center_loss_fn = CenterLoss(num_classes=1, feat_dim=Config.EMBED_SIZE, use_gpu=(device.type == 'cuda')).to(device)
     optimizer_center = optim.SGD(center_loss_fn.parameters(), lr=0.5) # Center loss usually needs high lr
@@ -138,19 +151,23 @@ def train_model(model, train_loader, val_loader, device):
             
             # We want to average features where !padding_mask
             active_features_mask = ~mask # True = Valid Token
-            
-            # features: (B, L, E)
-            # Sum valid features
-            sum_features = (features * active_features_mask.unsqueeze(-1).float()).sum(dim=1)
-            # Count valid tokens
-            valid_token_counts = active_features_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
-            
-            session_embeddings = sum_features / valid_token_counts # (B, E)
-            
-            loss_center = center_loss_fn(session_embeddings, labels=None) # Assume all normal (0) for clustering
-            
-            # Total Loss
-            loss = loss_mlm + Config.CENTER_LOSS_WEIGHT * loss_center
+
+            if Config.CENTER_LOSS_ENABLED:
+                # features: (B, L, E)
+                # Sum valid features
+                sum_features = (features * active_features_mask.unsqueeze(-1).float()).sum(dim=1)
+                # Count valid tokens
+                valid_token_counts = active_features_mask.sum(dim=1, keepdim=True).float().clamp(min=1.0)
+
+                session_embeddings = sum_features / valid_token_counts # (B, E)
+
+                loss_center = center_loss_fn(session_embeddings, labels=None) # Assume all normal (0) for clustering
+
+                # Total Loss
+                loss = loss_mlm + Config.CENTER_LOSS_WEIGHT * loss_center
+            else:
+                loss_center = torch.tensor(0.0)
+                loss = loss_mlm
             
             loss.backward()
             
@@ -292,9 +309,9 @@ def calculate_threshold(model, train_df, device, vocab_size):
                     session_id = session_indices[i].item()
                     session_mask = active_mask[i]
                     if session_mask.any():
-                        # CHANGE: Use MAX to capture sharp point anomalies
-                        max_session_loss = loss_per_token[i][session_mask].max().item()
-                        session_losses[session_id].append(max_session_loss)
+                        # Агрегация по Config.SCORE_AGG (max — точечные аномалии)
+                        session_loss = aggregate_token_losses(loss_per_token[i][session_mask])
+                        session_losses[session_id].append(session_loss)
 
     train_session_max_scores = [np.mean(losses) if losses else 0.0 for losses in session_losses.values()]
 
@@ -346,12 +363,11 @@ def compute_session_scores_from_sessions(sessions_list, model, device, vocab_siz
                 
                 for i in range(len(session_indices)):
                     sid = session_indices[i].item()
-                    # Max loss over masked tokens detects specific "broken" links better than mean
                     session_mask = active_mask[i]
                     if session_mask.any():
-                        # CHANGE: Use MAX instead of MEAN to preserve anomaly signal
-                        max_session_loss = loss_per_token[i][session_mask].max().item()
-                        session_losses[sid].append(max_session_loss)
+                        # Агрегация по Config.SCORE_AGG (max — точечные аномалии)
+                        session_loss = aggregate_token_losses(loss_per_token[i][session_mask])
+                        session_losses[sid].append(session_loss)
 
     # Ensure we return a score for EVERY input session to maintain alignment with labels
     scores = []

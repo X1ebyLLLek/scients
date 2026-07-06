@@ -50,7 +50,27 @@ class Config:
     RANDOM_STATE: int = 42
 
     # Scientific Improvement: Center Loss
+    CENTER_LOSS_ENABLED: bool = True   # Ablation: отключение center loss (--no_center_loss)
     CENTER_LOSS_WEIGHT: float = 0.01  # Weight for the center loss term
+
+    # Ablation: агрегация per-token loss в session score: 'max' (точечные аномалии)
+    # или 'mean' (усреднённая pseudo-log-likelihood)
+    SCORE_AGG: str = "max"
+
+    # === LSTM BASELINE (DeepLog-style, Du et al. 2017) ===
+    # Нейросетевой бейзлайн: next-event prediction LSTM.
+    # Экспериментально обосновывает выбор Transformer против рекуррентных сетей.
+    LSTM_ENABLED: bool = True
+    LSTM_EMBED_SIZE: int = 64
+    LSTM_HIDDEN_SIZE: int = 128
+    LSTM_NUM_LAYERS: int = 2
+    LSTM_DROPOUT: float = 0.1
+    LSTM_EPOCHS: int = 10
+    LSTM_LR: float = 0.001
+
+    # Multi-seed protocol: финальные метрики каждого запуска дописываются сюда,
+    # aggregate_results.py считает mean±std по сидам
+    RESULTS_LOG_PATH: str = "results_log.csv"
 
     # Rare Event Filtering: events occurring fewer than this many times are mapped to <UNK>
     RARE_EVENT_THRESHOLD: int = 5

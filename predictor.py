@@ -190,7 +190,23 @@ def run_demo(test_df, device, vocab_size):
             print(f"2. Analyzing a real abnormal session (length: {len(abnormal_sequence_example)})...")
             result_abnormal = analyze_log_sequence(abnormal_sequence_example, predictor_model, le_predictor, loaded_threshold, vocab_size=vocab_size, sigma=loaded_sigma)
             print(f"   Verdict: {result_abnormal.get('overall_verdict', 'Error')} (Risk: {result_abnormal.get('risk_level', 'N/A')})")
-            print(f"   Score: {result_abnormal.get('max_anomaly_score')} vs Thresholds (Suspicious: {result_abnormal.get('suspicious_threshold')}, Anomaly: {result_abnormal.get('anomaly_threshold')})\n")
+            print(f"   Score: {result_abnormal.get('max_anomaly_score')} vs Thresholds (Suspicious: {result_abnormal.get('suspicious_threshold')}, Anomaly: {result_abnormal.get('anomaly_threshold')})")
+
+            # Explainability: какие именно события сделали сессию аномальной
+            try:
+                from explainer import explain_session, print_explanation
+                explanation = explain_session(
+                    predictor_model, abnormal_codes_example, le_predictor,
+                    device, vocab_size, top_n=5
+                )
+                print_explanation(
+                    explanation,
+                    session_score=result_abnormal.get('max_anomaly_score'),
+                    threshold=result_abnormal.get('anomaly_threshold')
+                )
+            except Exception as e:
+                print(f"   (Explainability report failed: {e})")
+            print()
 
             print("3. Analyzing the same abnormal session from an 'admin' on a 'critical' resource...")
             result_critical = analyze_log_sequence(abnormal_sequence_example, predictor_model, le_predictor, loaded_threshold, vocab_size=vocab_size, context_user='admin', context_resource='critical', sigma=loaded_sigma)

@@ -14,14 +14,15 @@ import random
 
 from config import Config
 from seed import set_global_seed
-from utils import robust_train_test_split
+from utils import make_splits, append_results_log
 from preprocessing import prepare_data
 from dataset import MaskedLogDataset, collate_fn_mlm
 from model import TransformerPredictor
 from trainer import train_model, calculate_threshold, tune_threshold_mcc, evaluate_hyperparams
-from evaluator import evaluate_model, visualize_results, plot_comparison
+from evaluator import evaluate_model, visualize_results, plot_comparison, report_per_category
 from predictor import run_demo
 from baseline import run_baselines
+from baseline_lstm import run_lstm_baseline
 
 import argparse
 
@@ -33,7 +34,17 @@ def parse_args():
     parser.add_argument("--data_path", type=str, default=Config.URL_STRUCTURED, help="Path to structured log file")
     parser.add_argument("--no_synthetic", action="store_true", help="Disable synthetic data fallback")
     parser.add_argument("--no_hpo", action="store_true", help="Disable Hyperparameter Optimization")
-    parser.add_argument("--no_baselines", action="store_true", help="Skip baseline comparison")
+    parser.add_argument("--no_baselines", action="store_true", help="Skip classical baseline comparison")
+    parser.add_argument("--no_lstm", action="store_true", help="Skip LSTM (DeepLog-style) neural baseline")
+    parser.add_argument("--no_center_loss", action="store_true", help="Ablation: disable Center Loss")
+    parser.add_argument("--passes", type=int, default=Config.NUM_STOCHASTIC_PASSES,
+                        help="Ablation: number of stochastic MLM scoring passes")
+    parser.add_argument("--score_agg", type=str, choices=["max", "mean"], default=Config.SCORE_AGG,
+                        help="Ablation: per-token loss aggregation into session score")
+    parser.add_argument("--sample_rate", type=float, default=Config.DATA_SAMPLE_RATE,
+                        help="Fraction of sessions to use (speed up experiments)")
+    parser.add_argument("--tag", type=str, default="default",
+                        help="Experiment tag for results_log.csv (multi-seed aggregation)")
     parser.add_argument("--seed", type=int, default=Config.RANDOM_STATE, help="Random seed for reproducibility")
     return parser.parse_args()
 
@@ -49,10 +60,17 @@ def main():
     Config.BATCH_SIZE = args.batch_size
     Config.URL_STRUCTURED = args.data_path
     Config.RANDOM_STATE = args.seed
+    Config.NUM_STOCHASTIC_PASSES = args.passes
+    Config.SCORE_AGG = args.score_agg
+    Config.DATA_SAMPLE_RATE = args.sample_rate
     if args.no_synthetic:
         Config.USE_SYNTHETIC_FALLBACK = False
     if args.no_hpo:
         Config.HPO_ENABLED = False
+    if args.no_center_loss:
+        Config.CENTER_LOSS_ENABLED = False
+    if args.no_lstm:
+        Config.LSTM_ENABLED = False
 
     # ==========================================================================
     #                     STEP 1-2: DATA LOADING & PREPROCESSING
@@ -66,35 +84,11 @@ def main():
     #                     DATA SPLITTING (без data leakage!)
     # ==========================================================================
     # Разделение: Train(60%) / HPO-Val(13%) / Tune-Val(13%) / Test(14%)
-    #   - HPO-Val: используется ТОЛЬКО для подбора гиперпараметров
-    #   - Tune-Val: используется ТОЛЬКО для MCC-тюнинга порога
-    #   - Test: финальная оценка, не участвует ни в чём другом
+    # (логика вынесена в utils.make_splits — используется и run_ablation.py)
     # ==========================================================================
-    
-    # Split 1: Train(60%) + Temp(40%)
-    train_df, temp_df = robust_train_test_split(
-        session_df, test_size=0.4, min_anomalies_in_test=100,
-        random_state=Config.RANDOM_STATE
+    train_df, hpo_val_df, tune_val_df, test_df = make_splits(
+        session_df, random_state=Config.RANDOM_STATE
     )
-    
-    # Split 2: Temp → HPO-Val(33%) + Tune-Val(33%) + Test(34%)
-    # HPO-Val
-    hpo_val_df = temp_df.sample(frac=0.33, random_state=Config.RANDOM_STATE)
-    remaining_df = temp_df.drop(hpo_val_df.index)
-    
-    # Tune-Val + Test
-    tune_val_df = remaining_df.sample(frac=0.5, random_state=Config.RANDOM_STATE)
-    test_df = remaining_df.drop(tune_val_df.index)
-    
-    hpo_val_df = hpo_val_df.reset_index(drop=True)
-    tune_val_df = tune_val_df.reset_index(drop=True)
-    test_df = test_df.reset_index(drop=True)
-
-    print(f"\nData Split (no leakage):")
-    print(f"  Train:    {len(train_df):>6} sessions ({train_df['Label'].sum()} anomalies)")
-    print(f"  HPO-Val:  {len(hpo_val_df):>6} sessions ({hpo_val_df['Label'].sum()} anomalies)")
-    print(f"  Tune-Val: {len(tune_val_df):>6} sessions ({tune_val_df['Label'].sum()} anomalies)")
-    print(f"  Test:     {len(test_df):>6} sessions ({test_df['Label'].sum()} anomalies)")
 
     # Prepare session lists
     normal_train_sessions = train_df[train_df['Label'] == 0]['EventCode'].tolist()
@@ -128,6 +122,13 @@ def main():
     baseline_results = {}
     if not args.no_baselines:
         baseline_results = run_baselines(train_df, test_df, vocab_size)
+
+    # Нейросетевой бейзлайн: LSTM next-event prediction (DeepLog-style).
+    # Экспериментально обосновывает выбор Transformer против рекуррентных сетей.
+    if Config.LSTM_ENABLED:
+        baseline_results['LSTM (DeepLog)'] = run_lstm_baseline(
+            train_df, tune_val_df, test_df, vocab_size, device
+        )
 
     # ==========================================================================
     #                     HYPERPARAMETER OPTIMIZATION (AutoML)
@@ -220,12 +221,18 @@ def main():
     print(f"\n{'='*70}")
     print(f"   STEP 6: Final Evaluation on Test Set")
     print(f"{'='*70}")
-    test_pred_labels, test_losses, test_true_labels = evaluate_model(
+    test_pred_labels, test_losses, test_true_labels, test_session_ids, suspicious_threshold = evaluate_model(
         model, test_loader, anomaly_threshold, device, sigma=val_sigma
     )
-    
+
+    # Разбор detection rate по категориям аномалий BGL (KERNDTLB, KERNSTOR, ...)
+    report_per_category(
+        test_losses, test_true_labels, test_session_ids,
+        test_df, anomaly_threshold, suspicious_threshold
+    )
+
     # Собираем метрики Transformer для сравнения
-    from sklearn.metrics import precision_score, recall_score, f1_score, fbeta_score, matthews_corrcoef, roc_auc_score
+    from sklearn.metrics import precision_score, recall_score, f1_score, fbeta_score, matthews_corrcoef, roc_auc_score, average_precision_score
     transformer_metrics = {
         'precision': precision_score(test_true_labels, test_pred_labels, zero_division=0),
         'recall': recall_score(test_true_labels, test_pred_labels, zero_division=0),
@@ -237,6 +244,10 @@ def main():
         transformer_metrics['roc_auc'] = roc_auc_score(test_true_labels, test_losses)
     except ValueError:
         transformer_metrics['roc_auc'] = float('nan')
+    try:
+        transformer_metrics['pr_auc'] = average_precision_score(test_true_labels, test_losses)
+    except ValueError:
+        transformer_metrics['pr_auc'] = float('nan')
 
     # ==========================================================================
     #                     STEP 7: SAVE ARTIFACTS
@@ -263,22 +274,38 @@ def main():
     visualize_results(test_pred_labels, test_losses, test_true_labels, anomaly_threshold)
     
     # Сравнительная таблица и график
-    if baseline_results:
-        all_results = {'Transformer (BERT)': transformer_metrics}
-        all_results.update(baseline_results)
-        
-        print("\n" + "=" * 70)
+    all_results = {'Transformer (BERT)': transformer_metrics}
+    all_results.update(baseline_results)
+
+    if len(all_results) > 1:
+        print("\n" + "=" * 80)
         print("   FINAL COMPARISON: Transformer vs Baselines")
-        print("=" * 70)
-        print(f"{'Model':<20} {'MCC':>8} {'F1':>8} {'F2':>8} {'Prec':>8} {'Recall':>8} {'AUC':>8}")
-        print("-" * 70)
+        print("=" * 80)
+        print(f"{'Model':<20} {'MCC':>8} {'F1':>8} {'F2':>8} {'Prec':>8} {'Recall':>8} {'AUC':>8} {'PR-AUC':>8}")
+        print("-" * 80)
         for name, m in all_results.items():
             auc_str = f"{m['roc_auc']:.4f}" if not np.isnan(m.get('roc_auc', float('nan'))) else "   N/A"
+            pr_str = f"{m.get('pr_auc', float('nan')):.4f}" if not np.isnan(m.get('pr_auc', float('nan'))) else "   N/A"
             print(f"{name:<20} {m['mcc']:>8.4f} {m['f1']:>8.4f} {m['f2']:>8.4f} "
-                  f"{m['precision']:>8.4f} {m['recall']:>8.4f} {auc_str:>8}")
-        print("=" * 70)
-        
+                  f"{m['precision']:>8.4f} {m['recall']:>8.4f} {auc_str:>8} {pr_str:>8}")
+        print("=" * 80)
+
         plot_comparison(all_results)
+
+    # Multi-seed протокол: дописываем метрики в results_log.csv,
+    # aggregate_results.py посчитает mean±std по сидам
+    log_row = {
+        'tag': args.tag,
+        'seed': args.seed,
+        'epochs': Config.NUM_EPOCHS,
+        'center_loss': Config.CENTER_LOSS_ENABLED,
+        'passes': Config.NUM_STOCHASTIC_PASSES,
+        'score_agg': Config.SCORE_AGG,
+        'sample_rate': Config.DATA_SAMPLE_RATE,
+    }
+    for metric_name, value in transformer_metrics.items():
+        log_row[metric_name] = round(float(value), 6)
+    append_results_log(Config.RESULTS_LOG_PATH, log_row)
 
     # ==========================================================================
     #                     STEP 9: DEMO

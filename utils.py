@@ -106,6 +106,54 @@ def robust_train_test_split(session_df, test_size=0.2, min_anomalies_in_test=1, 
 
     return train_df, test_df
 
+def make_splits(session_df, random_state=42):
+    """
+    Единое разбиение данных без утечки (используется main.py и run_ablation.py):
+      Train ≈60% / HPO-Val ≈13% / Tune-Val ≈13% / Test ≈14%
+
+      - HPO-Val: только для подбора гиперпараметров
+      - Tune-Val: только для MCC-тюнинга порога
+      - Test: только финальная оценка
+
+    Returns:
+        train_df, hpo_val_df, tune_val_df, test_df
+    """
+    train_df, temp_df = robust_train_test_split(
+        session_df, test_size=0.4, min_anomalies_in_test=100,
+        random_state=random_state
+    )
+
+    hpo_val_df = temp_df.sample(frac=0.33, random_state=random_state)
+    remaining_df = temp_df.drop(hpo_val_df.index)
+
+    tune_val_df = remaining_df.sample(frac=0.5, random_state=random_state)
+    test_df = remaining_df.drop(tune_val_df.index)
+
+    hpo_val_df = hpo_val_df.reset_index(drop=True)
+    tune_val_df = tune_val_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+
+    print(f"\nData Split (no leakage):")
+    print(f"  Train:    {len(train_df):>6} sessions ({train_df['Label'].sum()} anomalies)")
+    print(f"  HPO-Val:  {len(hpo_val_df):>6} sessions ({hpo_val_df['Label'].sum()} anomalies)")
+    print(f"  Tune-Val: {len(tune_val_df):>6} sessions ({tune_val_df['Label'].sum()} anomalies)")
+    print(f"  Test:     {len(test_df):>6} sessions ({test_df['Label'].sum()} anomalies)")
+
+    return train_df, hpo_val_df, tune_val_df, test_df
+
+
+def append_results_log(path, row: dict):
+    """Дописывает строку финальных метрик в CSV (multi-seed протокол)."""
+    import csv, os
+    file_exists = os.path.exists(path)
+    with open(path, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+    print(f"Metrics appended to {path}")
+
+
 def get_risk_category(score: float, threshold: float) -> str:
     """Categorizes the anomaly score into risk levels."""
     if score < threshold:
