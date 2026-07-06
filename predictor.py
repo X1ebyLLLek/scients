@@ -8,7 +8,7 @@ from config import Config
 from utils import apply_contextual_weighting
 from model import TransformerPredictor
 
-from dataset import collate_fn_mlm
+from dataset import collate_fn_mlm, collate_fn_mlm_strided
 from functools import partial
 
 def analyze_log_sequence(
@@ -51,48 +51,58 @@ def analyze_log_sequence(
 
     dev = next(predictor_model.parameters()).device
     predictor_model.eval()
-    
-    # BERT Input Prep
-    # We want to score this session.
-    # Create a batch of N copies to average out the random masking variance.
-    num_copies = Config.NUM_STOCHASTIC_PASSES
-    
-    # Prepare batch for collate_fn_mlm
-    # batch list of tuples: (tensor_input, label, session_idx)
-    # tensor_input should be 1-based (dataset does +1).
-    # Here we have 0-based codes.
+
+    # BERT Input Prep: tensor_input should be 1-based (dataset does +1).
     input_tensor = torch.tensor([c + 1 for c in event_codes], dtype=torch.long)
-    
-    batch = [(input_tensor, 0, 0) for _ in range(num_copies)]
-    
-    # Use collate_fn_mlm
-    padded_inputs, targets, labels, mask, indices = collate_fn_mlm(batch, vocab_size=vocab_size)
-    
+
+    # Собираем батч проходов согласно Config.SCORE_MODE:
+    #   full       — SCORE_STRIDE детерминированных страйдовых масок (100% покрытие)
+    #   stochastic — NUM_STOCHASTIC_PASSES случайных масок 15%
+    if Config.SCORE_MODE == "full":
+        stride = Config.SCORE_STRIDE
+        parts = [collate_fn_mlm_strided([(input_tensor, 0, 0)], vocab_size=vocab_size,
+                                        stride=stride, offset=k)
+                 for k in range(stride)]
+        padded_inputs = torch.cat([p[0] for p in parts])
+        targets = torch.cat([p[1] for p in parts])
+        mask = torch.cat([p[3] for p in parts])
+        num_copies = stride
+    else:
+        num_copies = Config.NUM_STOCHASTIC_PASSES
+        batch = [(input_tensor, 0, 0) for _ in range(num_copies)]
+        padded_inputs, targets, labels, mask, indices = collate_fn_mlm(batch, vocab_size=vocab_size)
+
     padded_inputs = padded_inputs.to(dev)
     targets = targets.to(dev)
     mask = mask.to(dev)
-    
+
     criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
-    
-    scores = []
+
     with torch.no_grad():
         outputs, _ = predictor_model(padded_inputs, mask)
-        # outputs: (B, L, V)
-        # targets: (B, L)
-        
+        # outputs: (B, L, V), targets: (B, L)
         loss_per_token = criterion(outputs.permute(0, 2, 1), targets) # (B, L)
         active_mask = targets != -100
-        
-        for i in range(num_copies):
-            # Max loss over masked tokens for this copy
-            if active_mask[i].any():
-                score = loss_per_token[i][active_mask[i]].max().item()
-                scores.append(score)
-    
-    if not scores:
-        session_score = 0.0
-    else:
-        session_score = float(np.mean(scores))
+
+        if Config.SCORE_MODE == "full":
+            # Все позиции оценены ровно один раз — агрегируем по всем сразу
+            all_losses = loss_per_token[active_mask]
+            if all_losses.numel() == 0:
+                session_score = 0.0
+            elif Config.SCORE_AGG == "mean":
+                session_score = float(all_losses.mean().item())
+            else:
+                session_score = float(all_losses.max().item())
+        else:
+            scores = []
+            for i in range(num_copies):
+                # Per-pass агрегация, затем среднее по проходам
+                if active_mask[i].any():
+                    if Config.SCORE_AGG == "mean":
+                        scores.append(loss_per_token[i][active_mask[i]].mean().item())
+                    else:
+                        scores.append(loss_per_token[i][active_mask[i]].max().item())
+            session_score = float(np.mean(scores)) if scores else 0.0
 
     # Dynamic Stat Threshold
     suspicious_thr = threshold - (Config.SUSPICIOUS_SIGMA_MARGIN * sigma)

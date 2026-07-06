@@ -57,6 +57,15 @@ class Config:
     # или 'mean' (усреднённая pseudo-log-likelihood)
     SCORE_AGG: str = "max"
 
+    # Режим скоринга (КРИТИЧНО для честного сравнения с next-event моделями):
+    #   'full'       — детерминированное покрытие: SCORE_STRIDE проходов со страйдовой
+    #                  маской, каждая позиция маскируется РОВНО один раз (LogBERT-style).
+    #                  Случайные маски 15%×3 прохода пропускают аномальное событие
+    #                  в ~61% сессий (0.85^3) — full закрывает эту дыру.
+    #   'stochastic' — старое поведение: NUM_STOCHASTIC_PASSES случайных масок 15%
+    SCORE_MODE: str = "full"
+    SCORE_STRIDE: int = 7  # ~14% позиций за проход, 7 проходов = 100% покрытие
+
     # === LSTM BASELINE (DeepLog-style, Du et al. 2017) ===
     # Нейросетевой бейзлайн: next-event prediction LSTM.
     # Экспериментально обосновывает выбор Transformer против рекуррентных сетей.

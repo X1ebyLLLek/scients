@@ -41,6 +41,9 @@ def parse_args():
                         help="Ablation: number of stochastic MLM scoring passes")
     parser.add_argument("--score_agg", type=str, choices=["max", "mean"], default=Config.SCORE_AGG,
                         help="Ablation: per-token loss aggregation into session score")
+    parser.add_argument("--score_mode", type=str, choices=["full", "stochastic"], default=Config.SCORE_MODE,
+                        help="Scoring coverage: 'full' = every position masked exactly once "
+                             "(LogBERT-style), 'stochastic' = random 15%% masks")
     parser.add_argument("--sample_rate", type=float, default=Config.DATA_SAMPLE_RATE,
                         help="Fraction of sessions to use (speed up experiments)")
     parser.add_argument("--tag", type=str, default="default",
@@ -62,6 +65,7 @@ def main():
     Config.RANDOM_STATE = args.seed
     Config.NUM_STOCHASTIC_PASSES = args.passes
     Config.SCORE_AGG = args.score_agg
+    Config.SCORE_MODE = args.score_mode
     Config.DATA_SAMPLE_RATE = args.sample_rate
     if args.no_synthetic:
         Config.USE_SYNTHETIC_FALLBACK = False
@@ -222,7 +226,7 @@ def main():
     print(f"   STEP 6: Final Evaluation on Test Set")
     print(f"{'='*70}")
     test_pred_labels, test_losses, test_true_labels, test_session_ids, suspicious_threshold = evaluate_model(
-        model, test_loader, anomaly_threshold, device, sigma=val_sigma
+        model, test_loader, anomaly_threshold, device, sigma=val_sigma, vocab_size=vocab_size
     )
 
     # Разбор detection rate по категориям аномалий BGL (KERNDTLB, KERNSTOR, ...)
@@ -301,6 +305,7 @@ def main():
         'center_loss': Config.CENTER_LOSS_ENABLED,
         'passes': Config.NUM_STOCHASTIC_PASSES,
         'score_agg': Config.SCORE_AGG,
+        'score_mode': Config.SCORE_MODE,
         'sample_rate': Config.DATA_SAMPLE_RATE,
     }
     for metric_name, value in transformer_metrics.items():

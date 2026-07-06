@@ -26,6 +26,72 @@ def aggregate_token_losses(loss_values: torch.Tensor) -> float:
     return loss_values.max().item()
 
 
+def make_scoring_collates(vocab_size):
+    """
+    Набор collate-функций для проходов скоринга (режим Config.SCORE_MODE):
+      'full'       — SCORE_STRIDE детерминированных проходов, каждая позиция
+                     маскируется ровно один раз (100% покрытие, LogBERT-style)
+      'stochastic' — NUM_STOCHASTIC_PASSES случайных масок 15%
+                     (позиция не покрывается с вероятностью 0.85^K)
+    """
+    from functools import partial
+    from dataset import collate_fn_mlm, collate_fn_mlm_strided
+    if Config.SCORE_MODE == "full":
+        return [partial(collate_fn_mlm_strided, vocab_size=vocab_size,
+                        stride=Config.SCORE_STRIDE, offset=k)
+                for k in range(Config.SCORE_STRIDE)]
+    return [partial(collate_fn_mlm, vocab_size=vocab_size)] * Config.NUM_STOCHASTIC_PASSES
+
+
+def score_dataset_sessions(dataset, model, device, vocab_size,
+                           batch_size=None, desc="Scoring"):
+    """
+    Единый скоринг сессий (порог, MCC-тюнинг, тест — всё через эту функцию).
+
+    Returns:
+        dict: session_idx -> anomaly score
+        Семантика:
+          full:       агрегация (SCORE_AGG) по ВСЕМ позициям сессии, каждая оценена 1 раз
+          stochastic: per-pass агрегация, затем среднее по проходам (историческое поведение)
+    """
+    batch_size = batch_size or Config.BATCH_SIZE
+    criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
+    stochastic = Config.SCORE_MODE != "full"
+
+    per_pass_scores = defaultdict(list)   # stochastic: sid -> [score прохода, ...]
+    token_stats = {}                      # full: sid -> [max, sum, count]
+
+    model.eval()
+    for collate in make_scoring_collates(vocab_size):
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate)
+        with torch.no_grad():
+            for inputs, targets, labels, mask, session_indices in tqdm(loader, desc=desc, leave=False):
+                inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
+                outputs, _ = model(inputs, mask)
+                loss_per_token = criterion(outputs.permute(0, 2, 1), targets)  # (B, L)
+                active_mask = targets != -100
+
+                for i in range(len(session_indices)):
+                    sid = session_indices[i].item()
+                    session_mask = active_mask[i]
+                    if not session_mask.any():
+                        continue
+                    token_losses = loss_per_token[i][session_mask]
+                    if stochastic:
+                        per_pass_scores[sid].append(aggregate_token_losses(token_losses))
+                    else:
+                        mx, sm, ct = token_stats.get(sid, (0.0, 0.0, 0))
+                        token_stats[sid] = (max(mx, token_losses.max().item()),
+                                            sm + token_losses.sum().item(),
+                                            ct + token_losses.numel())
+
+    if stochastic:
+        return {sid: float(np.mean(scores)) for sid, scores in per_pass_scores.items()}
+    if Config.SCORE_AGG == "mean":
+        return {sid: sm / ct for sid, (mx, sm, ct) in token_stats.items()}
+    return {sid: mx for sid, (mx, sm, ct) in token_stats.items()}
+
+
 
 def evaluate_hyperparams(train_loader, val_loader, vocab_size, params, device):
     """
@@ -268,52 +334,12 @@ def calculate_threshold(model, train_df, device, vocab_size):
     normal_train_sessions_for_threshold = train_df[train_df['Label'] == 0]['EventCode'].tolist()
     # MaskedLogDataset expects labels, but here we can pass dummies or None
     threshold_dataset = MaskedLogDataset(normal_train_sessions_for_threshold, [0] * len(normal_train_sessions_for_threshold))
-    
-    from functools import partial
-    from dataset import collate_fn_mlm
-    collate = partial(collate_fn_mlm, vocab_size=vocab_size)
-    
-    threshold_loader = DataLoader(threshold_dataset, batch_size=Config.BATCH_SIZE, shuffle=False,
-                                  collate_fn=collate)
 
-    session_losses = defaultdict(list)
-    criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
-    
-    num_passes = Config.NUM_STOCHASTIC_PASSES  # Stabilize by averaging over multiple random masks
-    for _ in range(num_passes):
-        with torch.no_grad():
-            for inputs, targets, labels, mask, session_indices in tqdm(threshold_loader,
-                                                                       desc="Calculating threshold passes", leave=False):
-                inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
-                outputs, _ = model(inputs, mask)
-                
-                # Loss per token
-                # outputs: (B, L, V)
-                # targets: (B, L)
-                # We want loss per session. Ideally average loss over masked tokens? 
-                # Or max loss? 
-                # For anomaly detection with BERT, "Pseudo-Log-Likelihood" or "Reconstruction Error" is used.
-                # Let's use mean loss of masked tokens per session.
-                
-                # CrossEntropyLoss with reduction='none' returns (B, L) if input is (B, V, L) or (B, L, V) needs permutation?
-                # PyTorch CE expectation: (B, C, d1...) vs (B, d1...). with reduction='none' -> (B, d1...)
-                # We need to permute outputs to (B, V, L) for CE loss.
-                
-                loss_per_token = criterion(outputs.permute(0, 2, 1), targets) # (B, L)
-                
-                # We only care about masked tokens (targets != -100)
-                active_mask = targets != -100
-                
-                # Calculate mean loss per session for masked tokens
-                for i in range(len(session_indices)):
-                    session_id = session_indices[i].item()
-                    session_mask = active_mask[i]
-                    if session_mask.any():
-                        # Агрегация по Config.SCORE_AGG (max — точечные аномалии)
-                        session_loss = aggregate_token_losses(loss_per_token[i][session_mask])
-                        session_losses[session_id].append(session_loss)
+    # Единый скоринг (Config.SCORE_MODE: full-coverage или стохастический)
+    scores_by_sid = score_dataset_sessions(threshold_dataset, model, device, vocab_size,
+                                           desc="Calculating threshold passes")
 
-    train_session_max_scores = [np.mean(losses) if losses else 0.0 for losses in session_losses.values()]
+    train_session_max_scores = list(scores_by_sid.values()) if scores_by_sid else [0.0]
 
     # Use Robust Statistics (Median Absolute Deviation) instead of Percentile
     # This prevents the threshold from being skewed by outliers (dirty normal data)
@@ -340,46 +366,14 @@ def calculate_threshold(model, train_df, device, vocab_size):
 def compute_session_scores_from_sessions(sessions_list, model, device, vocab_size, batch_size=Config.BATCH_SIZE):
     dummy_labels = [0] * len(sessions_list)
     temp_dataset = MaskedLogDataset(sessions_list, dummy_labels)
-    
-    from functools import partial
-    from dataset import collate_fn_mlm
-    collate = partial(collate_fn_mlm, vocab_size=vocab_size)
-    
-    temp_loader = DataLoader(temp_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate)
 
-    model.eval()
-    session_losses = defaultdict(list)
-    criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
-
-    num_passes = Config.NUM_STOCHASTIC_PASSES
-    for _ in range(num_passes):
-        with torch.no_grad():
-            for inputs, targets, _, mask, session_indices in temp_loader:
-                inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
-                outputs, _ = model(inputs, mask)
-                
-                loss_per_token = criterion(outputs.permute(0, 2, 1), targets)
-                active_mask = targets != -100
-                
-                for i in range(len(session_indices)):
-                    sid = session_indices[i].item()
-                    session_mask = active_mask[i]
-                    if session_mask.any():
-                        # Агрегация по Config.SCORE_AGG (max — точечные аномалии)
-                        session_loss = aggregate_token_losses(loss_per_token[i][session_mask])
-                        session_losses[sid].append(session_loss)
+    # Единый скоринг (Config.SCORE_MODE: full-coverage или стохастический)
+    scores_by_sid = score_dataset_sessions(temp_dataset, model, device, vocab_size,
+                                           batch_size=batch_size, desc="Scoring sessions")
 
     # Ensure we return a score for EVERY input session to maintain alignment with labels
-    scores = []
-    for i in range(len(sessions_list)):
-        if i in session_losses and len(session_losses[i]) > 0:
-            scores.append(np.mean(session_losses[i]))
-        else:
-            # Session was filtered out (too short) or had no valid masked tokens (unlikely)
-            # Assign 0.0 (Normal) as default since we can't judge it
-            scores.append(0.0)
-    
-    return scores
+    # Session was filtered out (too short) → 0.0 (Normal) since we can't judge it
+    return [float(scores_by_sid.get(i, 0.0)) for i in range(len(sessions_list))]
 
 def tune_threshold_mcc(model, val_sessions, val_labels, anomaly_threshold, device, vocab_size):
     """

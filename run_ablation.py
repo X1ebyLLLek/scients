@@ -2,9 +2,12 @@
 run_ablation.py — Ablation study: вклад каждого научного улучшения в итоговое качество.
 
 Проверяемые компоненты:
-  1. Center Loss        — обучение с/без кластеризации нормальных эмбеддингов
-  2. Stochastic Scoring — 3 стохастических прохода vs 1 проход
-  3. Score Aggregation  — max (точечные аномалии) vs mean (pseudo-log-likelihood)
+  1. Score Coverage     — full (каждая позиция маскируется ровно 1 раз, LogBERT-style)
+                          vs stochastic (случайные маски 15%: позиция не покрыта
+                          с вероятностью 0.85^K — аномалия может остаться неоценённой)
+  2. Center Loss        — обучение с/без кластеризации нормальных эмбеддингов
+  3. Stochastic passes  — 3 стохастических прохода vs 1 проход
+  4. Score Aggregation  — max (точечные аномалии) vs mean (pseudo-log-likelihood)
 
 Протокол (честный, без утечки):
   - Обучаются ДВЕ модели: Full (Center Loss ON) и NoCenterLoss (OFF);
@@ -70,12 +73,14 @@ def train_variant(name, center_loss_enabled, train_loader, hpo_val_loader, vocab
     return train_model(model, train_loader, hpo_val_loader, device)
 
 
-def evaluate_variant(name, model, tune_val_df, test_df, vocab_size, device, passes, agg):
+def evaluate_variant(name, model, tune_val_df, test_df, vocab_size, device,
+                     passes=3, agg="max", mode="full"):
     """MCC-тюнинг порога на Tune-Val + метрики на Test для заданного скоринга."""
     Config.NUM_STOCHASTIC_PASSES = passes
     Config.SCORE_AGG = agg
+    Config.SCORE_MODE = mode
 
-    print(f"\n--- Ablation variant: {name} (passes={passes}, agg={agg}) ---")
+    print(f"\n--- Ablation variant: {name} (mode={mode}, passes={passes}, agg={agg}) ---")
 
     tune_scores = compute_session_scores_from_sessions(
         tune_val_df['EventCode'].tolist(), model, device, vocab_size)
@@ -127,18 +132,20 @@ def main():
 
     # === Модель 1: Full (Center Loss ON) + варианты скоринга без переобучения ===
     model_full = train_variant("full", True, train_loader, hpo_val_loader, vocab_size, device, args.seed)
-    results.append(evaluate_variant("Full (CL + 3 passes + max)", model_full,
-                                    tune_val_df, test_df, vocab_size, device, passes=3, agg="max"))
-    results.append(evaluate_variant("- Stochastic (1 pass)", model_full,
-                                    tune_val_df, test_df, vocab_size, device, passes=1, agg="max"))
+    results.append(evaluate_variant("Full (CL + full-cov + max)", model_full,
+                                    tune_val_df, test_df, vocab_size, device, mode="full", agg="max"))
+    results.append(evaluate_variant("- Coverage (stoch, 3 pass)", model_full,
+                                    tune_val_df, test_df, vocab_size, device, mode="stochastic", passes=3, agg="max"))
+    results.append(evaluate_variant("- Coverage (stoch, 1 pass)", model_full,
+                                    tune_val_df, test_df, vocab_size, device, mode="stochastic", passes=1, agg="max"))
     results.append(evaluate_variant("- Max agg (mean)", model_full,
-                                    tune_val_df, test_df, vocab_size, device, passes=3, agg="mean"))
+                                    tune_val_df, test_df, vocab_size, device, mode="full", agg="mean"))
 
     # === Модель 2: без Center Loss, скоринг по умолчанию ===
     model_nocl = train_variant("nocl", False, train_loader, hpo_val_loader, vocab_size, device, args.seed)
     Config.CENTER_LOSS_ENABLED = True  # восстановить для чистоты
     results.append(evaluate_variant("- Center Loss", model_nocl,
-                                    tune_val_df, test_df, vocab_size, device, passes=3, agg="max"))
+                                    tune_val_df, test_df, vocab_size, device, mode="full", agg="max"))
 
     # === Итоговая таблица ===
     print("\n" + "=" * 90)

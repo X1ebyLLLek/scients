@@ -146,6 +146,18 @@ def append_results_log(path, row: dict):
     """Дописывает строку финальных метрик в CSV (multi-seed протокол)."""
     import csv, os
     file_exists = os.path.exists(path)
+
+    # Если схема колонок изменилась (обновление кода) — старый лог в .bak,
+    # иначе строки перестанут парситься
+    if file_exists:
+        with open(path, 'r', encoding='utf-8') as f:
+            existing_header = f.readline().strip().split(',')
+        if existing_header != list(row.keys()):
+            backup = path + '.bak'
+            os.replace(path, backup)
+            print(f"results log schema changed — old log moved to {backup}")
+            file_exists = False
+
     with open(path, 'a', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
         if not file_exists:

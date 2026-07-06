@@ -7,45 +7,27 @@ from tqdm import tqdm
 from collections import defaultdict
 from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, confusion_matrix, recall_score, matthews_corrcoef, fbeta_score, average_precision_score
 from config import Config
-from trainer import aggregate_token_losses
+from trainer import score_dataset_sessions
 
-def evaluate_model(model, test_loader, anomaly_threshold, device, sigma=0.5):
+def evaluate_model(model, test_loader, anomaly_threshold, device, sigma=0.5, vocab_size=None):
     """
     Evaluates the model on the test set and calculates metrics.
+    Скоринг — через единый score_dataset_sessions (Config.SCORE_MODE).
     """
     print("\n--- Test Model and Calculate Performance Metrics (Session-Based) ---")
-    model.eval()
-    session_losses = defaultdict(list)
-    session_true_labels = {}
-    
-    criterion = nn.CrossEntropyLoss(ignore_index=-100, reduction='none')
 
-    num_passes = Config.NUM_STOCHASTIC_PASSES
-    for _ in range(num_passes):
-        with torch.no_grad():
-            for inputs, targets, labels, mask, session_indices in tqdm(test_loader, desc="Evaluating on Test Set", leave=False):
-                inputs, targets, mask = inputs.to(device), targets.to(device), mask.to(device)
-                outputs, _ = model(inputs, mask)
-                
-                loss_per_token = criterion(outputs.permute(0, 2, 1), targets) # (B, L)
-                active_mask = targets != -100
-                
-                for i in range(len(session_indices)):
-                    session_id = session_indices[i].item()
+    dataset = test_loader.dataset
+    if vocab_size is None:
+        # main.py строит loader через partial(collate_fn_mlm, vocab_size=...)
+        vocab_size = test_loader.collate_fn.keywords['vocab_size']
 
-                    # Агрегация по Config.SCORE_AGG (max — точечные аномалии)
-                    session_mask = active_mask[i]
-                    if session_mask.any():
-                        session_loss = aggregate_token_losses(loss_per_token[i][session_mask])
-                        session_losses[session_id].append(session_loss)
+    scores_by_sid = score_dataset_sessions(dataset, model, device, vocab_size,
+                                           batch_size=test_loader.batch_size,
+                                           desc="Evaluating on Test Set")
 
-                    if session_id not in session_true_labels:
-                        session_true_labels[session_id] = labels[i].item()
-
-    ordered_session_ids = sorted(session_losses.keys())
-    # Use np.mean to be consistent with trainer.py (MLM pseudo-likelihood)
-    final_scores = [float(np.mean(session_losses[sid])) if len(session_losses[sid]) > 0 else 0.0 for sid in ordered_session_ids]
-    final_true_labels = [int(session_true_labels.get(sid, 0)) for sid in ordered_session_ids]
+    ordered_session_ids = sorted(scores_by_sid.keys())
+    final_scores = [float(scores_by_sid[sid]) for sid in ordered_session_ids]
+    final_true_labels = [int(dataset.labels[sid]) if dataset.labels else 0 for sid in ordered_session_ids]
     
     suspicious_threshold = anomaly_threshold - (Config.SUSPICIOUS_SIGMA_MARGIN * sigma)
     suspicious_threshold = max(0.5, suspicious_threshold)  # Clamp to reasonable minimum

@@ -100,12 +100,43 @@ def collate_fn_mlm(batch: List[Tuple[torch.Tensor, int, int]], vocab_size: int) 
     # 80% replace with MASK
     indices_replaced = torch.bernoulli(torch.full(targets.shape, 0.8)).bool() & masked_indices
     padded_inputs[indices_replaced] = mask_token_id
-    
+
     # 10% replace with random token (1..vocab_size)
     indices_random = torch.bernoulli(torch.full(targets.shape, 0.5)).bool() & masked_indices & ~indices_replaced
     random_words = torch.randint(1, vocab_size + 1, targets.shape, dtype=torch.long)
     padded_inputs[indices_random] = random_words[indices_random]
-    
+
     # 10% keep original (already in padded_inputs)
-    
+
     return padded_inputs, targets, labels, padding_mask, session_indices
+
+
+def collate_fn_mlm_strided(batch: List[Tuple[torch.Tensor, int, int]], vocab_size: int,
+                           stride: int, offset: int):
+    """
+    Детерминированное маскирование для СКОРИНГА (не для обучения):
+    маскируются позиции с index % stride == offset.
+
+    Прогон offset=0..stride-1 покрывает КАЖДУЮ позицию ровно один раз —
+    гарантия, что ни одно аномальное событие не останется неоценённым
+    (случайные маски 15% пропускают позицию с вероятностью 0.85^K).
+    Всегда заменяем на [MASK] (без 80/10/10 — здесь нет задачи обучения).
+    """
+    inputs_list, labels_list, session_indices_list = zip(*batch)
+
+    padded_inputs = pad_sequence(inputs_list, batch_first=True, padding_value=0)
+    labels = torch.tensor(labels_list, dtype=torch.long)
+    session_indices = torch.tensor(session_indices_list, dtype=torch.long)
+    padding_mask = (padded_inputs == 0)
+
+    seq_len = padded_inputs.size(1)
+    positions = torch.arange(seq_len)
+    masked_indices = ((positions % stride) == offset).unsqueeze(0).expand_as(padded_inputs) & ~padding_mask
+
+    targets = padded_inputs.clone()
+    targets[~masked_indices] = -100
+
+    masked_inputs = padded_inputs.clone()
+    masked_inputs[masked_indices] = vocab_size  # MASK token id
+
+    return masked_inputs, targets, labels, padding_mask, session_indices
